@@ -1,9 +1,12 @@
+import path from "node:path";
 import { readConfigFileSnapshot } from "../../config/config.js";
 import { resolveStateDir } from "../../config/paths.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { ScheduledTaskAutoStartRecoveryError } from "../../daemon/schtasks-update-recovery.js";
 import { resolveGatewayService } from "../../daemon/service.js";
+import { isAbortError } from "../../infra/abort-signal.js";
 import { formatErrorMessage } from "../../infra/errors.js";
+import { tryReadJson } from "../../infra/json-files.js";
 import type { PackageUpdateTransaction } from "../../infra/package-update-steps.js";
 import { validateUpdateCandidateCanary } from "../../infra/update-candidate-canary.js";
 import type { UpdateCandidateRehearsal } from "../../infra/update-candidate-rehearsal.js";
@@ -20,7 +23,10 @@ import { recordUpdateRunPhase, recordUpdateRunStep } from "../../infra/update-ru
 import { readCurrentGitUpdateRecovery } from "../../infra/update-runner-git-recovery.js";
 import type { UpdateRunResult } from "../../infra/update-runner.js";
 import { defaultRuntime } from "../../runtime.js";
-import type { OpenClawSchemaVersions } from "../../state/openclaw-schema-versions.js";
+import {
+  parsePackageOpenClawSchemaVersions,
+  type OpenClawSchemaVersions,
+} from "../../state/openclaw-schema-versions.js";
 import { replaceCliName, resolveCliName } from "../cli-name.js";
 import { formatCliCommand } from "../command-format.js";
 import {
@@ -72,6 +78,7 @@ import { selectPackageExecutor, type PreparedPackageUpdate } from "./update-pack
 const CLI_NAME = resolveCliName();
 
 type MutableUpdateExecutionResult = {
+  mutationStarted: boolean;
   result: UpdateRunResult;
   failure?: { cause: unknown; detail: string };
   preManagedServiceStop: PreManagedServiceStop | undefined;
@@ -80,6 +87,7 @@ type MutableUpdateExecutionResult = {
   packageTransaction?: PackageUpdateTransaction;
   schemaVersions?: Awaited<ReturnType<typeof readUpdateStateSchemaVersions>>;
   candidateSchemaVersions?: OpenClawSchemaVersions;
+  previousSchemaVersions?: OpenClawSchemaVersions;
   previousVerified?: boolean;
 };
 
@@ -146,6 +154,7 @@ export async function executeMutableUpdate(params: {
   let packageTransaction: PackageUpdateTransaction | undefined;
   let schemaVersions: Awaited<ReturnType<typeof readUpdateStateSchemaVersions>> | undefined;
   let candidateSchemaVersions: OpenClawSchemaVersions | undefined;
+  let previousSchemaVersions: OpenClawSchemaVersions | undefined;
   let previousVerified = false;
   let candidateFailureReason: string | undefined;
   let validatedConfigSnapshot: { config: OpenClawConfig; hash?: string | null } | undefined;
@@ -292,6 +301,7 @@ export async function executeMutableUpdate(params: {
     params.updateInstallKind === "package" ? selectPackageExecutor() : undefined;
   let preparedPackageUpdate: PreparedPackageUpdate | undefined;
   let packageActivationStarted = false;
+  let mutationStarted = false;
   const validateCandidate = async (root: string) => {
     const env = ownedManagedUpdateContext?.env ?? params.opts.run?.env ?? process.env;
     if (params.opts.run) {
@@ -334,7 +344,6 @@ export async function executeMutableUpdate(params: {
     let validation = await validate();
     if (validation.status === "error") {
       candidateFailureReason = validation.reason;
-      const failedValidation = validation;
       const repair = await runUpdateCommandRepair({
         root: params.root,
         candidateRoot: root,
@@ -349,21 +358,21 @@ export async function executeMutableUpdate(params: {
               ? "git"
               : (params.packageInstallTarget?.manager ?? "unknown"),
           root,
-          reason: failedValidation.reason,
+          reason: validation.reason,
           before: { version: await readPackageVersion(params.root) },
           after: { version: await readPackageVersion(root) },
-          steps: failedValidation.steps,
-          durationMs: failedValidation.durationMs,
+          steps: validation.steps,
+          durationMs: validation.durationMs,
         },
         validate: async (signal, assertCurrent, rehearsal) => {
-          validation = await validate(signal, rehearsal, assertCurrent);
+          const repairValidation = await validate(signal, rehearsal, assertCurrent);
           return {
-            ok: validation.status === "ok",
-            score: validation.steps.filter((step) => step.exitCode === 0).length,
+            ok: repairValidation.status === "ok",
+            score: repairValidation.steps.filter((step) => step.exitCode === 0).length,
             summary:
-              validation.status === "ok"
+              repairValidation.status === "ok"
                 ? "Candidate validation passed."
-                : validation.logTail.join("\n"),
+                : repairValidation.logTail.join("\n"),
           };
         },
       });
@@ -374,7 +383,7 @@ export async function executeMutableUpdate(params: {
         ) {
           candidateFailureReason = repair.reason;
         }
-        return failedValidation.steps;
+        return validation.steps;
       }
       candidateFailureReason = undefined;
       // Repair's disposable state is gone; only surviving candidate changes may authorize activation.
@@ -401,6 +410,9 @@ export async function executeMutableUpdate(params: {
     }
     const config = snapshot.config;
     await recheckSchemas(admittedTargetSchemaVersions);
+    previousSchemaVersions = parsePackageOpenClawSchemaVersions(
+      await tryReadJson<unknown>(path.join(params.root, "package.json")),
+    );
     schemaVersions = candidateSchemaVersions
       ? await readUpdateStateSchemaVersions({
           stateDir: resolveStateDir(env),
@@ -481,6 +493,7 @@ export async function executeMutableUpdate(params: {
     if (params.updateInstallKind === "package") {
       preManagedServiceStop?.windowsTaskAutoStartRecovery?.beginMutation();
     }
+    mutationStarted = true;
     params.onActivation?.();
   };
   try {
@@ -562,7 +575,8 @@ export async function executeMutableUpdate(params: {
         onTransaction: (transaction) => {
           packageTransaction = transaction;
         },
-        managedServiceEnv: preManagedServiceStop?.serviceEnv,
+        // Foreign inspection metadata cannot authorize backup or Doctor writes.
+        getManagedServiceEnv: () => ownedManagedUpdateContext?.env,
         invocationCwd: params.invocationCwd,
         nodeRunner: params.packageUpdateNodeRunner,
         validateCandidate: async (candidateRoot) => {
@@ -632,6 +646,7 @@ export async function executeMutableUpdate(params: {
           cwd: params.root,
           durationMs,
           exitCode: 1,
+          ...(isAbortError(err) ? { termination: "signal" as const } : {}),
           stderrTail: message,
         },
       ],
@@ -645,12 +660,14 @@ export async function executeMutableUpdate(params: {
   return {
     result,
     failure,
+    mutationStarted,
     preManagedServiceStop,
     ownedManagedUpdateContext,
     recoveryEnv,
     packageTransaction,
     schemaVersions,
     candidateSchemaVersions,
+    previousSchemaVersions,
     previousVerified,
   };
 }
